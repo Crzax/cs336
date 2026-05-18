@@ -4,6 +4,7 @@ import os
 from typing import Any, BinaryIO
 from multiprocessing import Pool
 import heapq
+import unicodedata
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -59,17 +60,19 @@ def process_chunk(args) -> dict[tuple[bytes, ...], int]:
         f.seek(start)
         text = f.read(end - start).decode("utf-8", errors="ignore")
         pattern = "|".join(re.escape(token) for token in special_tokens)
-        parts = re.split(pattern, text)
+        # parts = re.split(pattern, text)
         # 预分词
         # dict[tuple(bytes,...), int]
         PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        for part in parts:
-            matches = regex.finditer(PAT, part)
-            for match in matches:
+        for part in re.split(pattern, text):
+            # matches = regex.finditer(PAT, part)
+            for match in regex.finditer(PAT, part):
                 token_str = match.group()
                 token_bytes = token_str.encode("utf-8")
-                key = tuple(bytes([b]) for b in token_bytes)
+                # key = tuple(bytes([b]) for b in token_bytes)
+                key = token_bytes
                 word_counts[key] = word_counts.get(key, 0) + 1
+
     return word_counts
 
 def train_bpe(input_path, vocab_size, special_tokens=None) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
@@ -83,8 +86,9 @@ def train_bpe(input_path, vocab_size, special_tokens=None) -> tuple[dict[int, by
 
     with open(input_path, "rb") as f:
         # 分割语料
+        num_chunks = 256
         num_processes = 32
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+        boundaries = find_chunk_boundaries(f, num_chunks, b"<|endoftext|>")
         word_counts = {} 
         pair_counts = {}
         pair_to_word = {}
@@ -98,11 +102,10 @@ def train_bpe(input_path, vocab_size, special_tokens=None) -> tuple[dict[int, by
         ]
 
         with Pool(processes=num_processes) as pool:
-            results = pool.map(process_chunk, args_list)
-        
-        for result in results:
-            for key, count in result.items():
-                word_counts[key] = word_counts.get(key, 0) + count
+            for result in pool.imap_unordered(process_chunk, args_list, chunksize=1):
+                for key, count in result.items():
+                    tk = tuple(key[j:j+1] for j in range(len(key)))
+                    word_counts[tk] = word_counts.get(tk, 0) + count
 
         for word, count in word_counts.items():
             if len(word) > 1:
@@ -116,7 +119,7 @@ def train_bpe(input_path, vocab_size, special_tokens=None) -> tuple[dict[int, by
         
         count_heap = [-c for c in count_to_pair.keys()]
         heapq.heapify(count_heap)
-        
+
         def _get_max_count():
             while count_heap:
                 c = -count_heap[0]
@@ -169,9 +172,6 @@ def train_bpe(input_path, vocab_size, special_tokens=None) -> tuple[dict[int, by
                     _set_count(pair, new, old)
                     if new <= 0:
                         del pair_counts[pair]
-                    else:
-                        count_to_pair[new].add(pair)
-
 
                 new_word = tuple(new_word)
                 for i in range(len(new_word) - 1):
@@ -181,12 +181,19 @@ def train_bpe(input_path, vocab_size, special_tokens=None) -> tuple[dict[int, by
                     new = pair_counts[pair]
                     _set_count(pair, new, old)
                     pair_to_word.setdefault(pair, set()).add(new_word)
-                    count_to_pair[new].add(pair)
                 word_counts[new_word] = word_counts.pop(word) + word_counts.get(new_word, 0)
-            
-            pair_counts.pop(max_pair, None)
-            pair_to_word.pop(max_pair, None)
             
     for spt in special_tokens:
         vocab[len(vocab)] = spt.encode("utf-8")
     return (vocab, merges)
+
+def get_gpt2_map():
+    n = 0
+    map = {}
+    for i in range(256):
+        if unicodedata.category(chr(i))[0] in ('L', 'N', 'P', 'S'):
+            map[i] = chr(i)
+        else:
+            map[i] = chr(n + 256)
+            n += 1
+    return map
