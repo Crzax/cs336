@@ -2,8 +2,9 @@ import json
 from typing import Iterable, Iterator, BinaryIO
 import re
 import regex
+import unicodedata
 
-class tokenize:
+class tokenizer:
     def __init__(   
         self,  
         vocab:dict[int, bytes], 
@@ -23,12 +24,27 @@ class tokenize:
         merges_filepath:str, 
         special_tokens:list[str] | None = None
         ):
+        def _get_gpt2_map():
+            n = 0
+            map = {}
+            for i in range(256):
+                if unicodedata.category(chr(i))[0] in ('L', 'N', 'P', 'S'):
+                    map[i] = bytes([i])
+                else:
+                    map[n + 256] = bytes([i])
+                    n += 1
+            return map
+        gpt2_map = _get_gpt2_map()
+
         with open(vocab_filepath, "r", encoding="utf-8") as f:
-            vocab = json.load(f)
-            vocab = {v : bytes(k) for k, v in vocab.items()}
+            vocab_ori = json.load(f)
+            vocab = {}
+            for k, v in vocab_ori.items():
+                vocab[v] = bytes(b"".join(gpt2_map[ord(c)] for c in k))
+
         with open(merges_filepath, "r", encoding="utf-8") as f:
             merges = f.readlines()
-            merges = [tuple(bytes(k, "utf-8") for k in line.strip().split(" ")) for line in merges]
+            merges = [tuple(b"".join(gpt2_map[ord(c)] for c in k) for k in line.strip().split(" ")) for line in merges]
 
         return cls(vocab, merges, special_tokens)
     
