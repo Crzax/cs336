@@ -70,23 +70,27 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
-        self.w_q = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.w_k = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.w_v = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.w_o = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         if theta is not None and max_seq_len is not None:
             self.rotary_positional_embedding = RotaryPositionalEmbedding(theta, self.d_k, max_seq_len, device=device)
     
     def forward(self, x, tokens_positions=None):
-        q = self.w_q(x)
-        k = self.w_k(x)
-        v = self.w_v(x)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
         q = rearrange(q, "batch_size seq_len (num_heads d_k) -> batch_size num_heads seq_len d_k", num_heads=self.num_heads)
         k = rearrange(k, "batch_size seq_len (num_heads d_k) -> batch_size num_heads seq_len d_k", num_heads=self.num_heads)
         v = rearrange(v, "batch_size seq_len (num_heads d_k) -> batch_size num_heads seq_len d_k", num_heads=self.num_heads)
         
         seq_len = x.size(-2)
         assert tokens_positions is None or tokens_positions.size(-1) == seq_len
+
+        if tokens_positions is None and hasattr(self, 'rotary_positional_embedding'):
+            tokens_positions = torch.arange(seq_len, device=x.device)
+
         if tokens_positions is not None:
             q = self.rotary_positional_embedding(q, tokens_positions)
             k = self.rotary_positional_embedding(k, tokens_positions)
@@ -94,4 +98,34 @@ class MultiHeadAttention(nn.Module):
         mask = torch.tril(torch.full((seq_len, seq_len), True, device=x.device))
         o = scaled_dot_product_attention(q, k, v, mask)
         o = rearrange(o, "batch_size num_heads seq_len d_k -> batch_size seq_len (num_heads d_k)", num_heads=self.num_heads)
-        return self.w_o(o)
+        return self.output_proj(o)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, max_seq_len=None, theta=None, device=None, dtype=None):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.attn = MultiHeadAttention(d_model, num_heads, max_seq_len, theta, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+    
+    def forward(self, x, tokens_positions=None):
+        x = x + self.attn(self.ln1(x), tokens_positions)
+        return x + self.ffn(self.ln2(x))
+
+class TransformerLM(nn.Module):
+    def __init__(self, d_model, num_layers, num_heads, d_ff, vocab_size, max_seq_len=None, theta=None, device=None, dtype=None):
+        super().__init__()
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
+    
+    def forward(self, token_ids, tokens_positions=None):
+        x = self.token_embeddings(token_ids)
+        for layer in self.layers:
+            x = layer(x, tokens_positions)
+        x = self.ln_final(x)
+        return self.lm_head(x)

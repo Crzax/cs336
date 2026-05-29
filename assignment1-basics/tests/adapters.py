@@ -145,7 +145,7 @@ def run_multihead_self_attention(
         implementation with the given QKV projection weights and input features.
     """
     mha = nn.MultiHeadAttention(d_model, num_heads)
-    mha.load_state_dict({"w_q.weight": q_proj_weight, "w_k.weight": k_proj_weight, "w_v.weight": v_proj_weight, "w_o.weight": o_proj_weight})
+    mha.load_state_dict({"q_proj.weight": q_proj_weight, "k_proj.weight": k_proj_weight, "v_proj.weight": v_proj_weight, "output_proj.weight": o_proj_weight})
     return mha(in_features)
 
 
@@ -187,7 +187,7 @@ def run_multihead_self_attention_with_rope(
         implementation with the given QKV projection weights and input features.
     """
     mha = nn.MultiHeadAttention(d_model, num_heads, max_seq_len, theta)
-    mha.load_state_dict({"w_q.weight": q_proj_weight, "w_k.weight": k_proj_weight, "w_v.weight": v_proj_weight, "w_o.weight": o_proj_weight})
+    mha.load_state_dict({"q_proj.weight": q_proj_weight, "k_proj.weight": k_proj_weight, "v_proj.weight": v_proj_weight, "output_proj.weight": o_proj_weight})
     return mha(in_features, token_positions)
 
 
@@ -284,8 +284,9 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
-
+    f = nn.TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta)
+    f.load_state_dict(weights)
+    return f(in_features)
 
 def run_transformer_lm(
     vocab_size: int,
@@ -366,9 +367,10 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
-
-
+    f = nn.TransformerLM(d_model, num_layers, num_heads, d_ff, vocab_size, context_length, rope_theta)
+    f.load_state_dict(weights)
+    return f(in_indices)
+    
 def run_rmsnorm(
     d_model: int,
     eps: float,
