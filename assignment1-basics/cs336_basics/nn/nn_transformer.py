@@ -52,10 +52,6 @@ class RotaryPositionalEmbedding(nn.Module):
         ], dim = -1)
         return rearrange(out, '... seq_len d_k k -> ... seq_len (d_k k)')
 
-def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
-    x_max = x.amax(dim=dim, keepdim=True)
-    return torch.exp(x - x_max) / torch.exp(x - x_max).sum(dim=dim, keepdim=True)
-
 def scaled_dot_product_attention(q, k ,v, mask=None):
     atten = einsum(q, k, 'batch_size ... seq_len_q d_k, batch_size ... seq_len_k d_k -> batch_size ... seq_len_q seq_len_k')
     atten = atten / q.size(-1) ** 0.5

@@ -41,3 +41,14 @@ class Embedding(nn.Module):
     
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.weight[token_ids]
+
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    x_max = x.amax(dim=dim, keepdim=True)
+    return torch.exp(x - x_max) / torch.exp(x - x_max).sum(dim=dim, keepdim=True)
+
+def cross_entropy(o: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    o_max = o.amax(dim=-1, keepdim=True)
+    log_sum_exp = torch.log(torch.exp(o - o_max).sum(dim=-1, keepdim=True)) + o_max
+    target_logit = o.gather(dim=-1, index=x.unsqueeze(-1))                           
+    loss = (log_sum_exp - target_logit).squeeze(-1)                                  
+    return loss.mean()
