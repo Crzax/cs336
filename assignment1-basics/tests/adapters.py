@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
-from cs336_basics import bpe, tokenizer, opt
+from cs336_basics import bpe, tokenizer, opt, data
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -430,7 +430,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return data.data_loading(dataset, batch_size, context_length, device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -526,8 +526,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
-
+    return data.save_checkpoint(model, optimizer, iteration, out)
 
 def run_load_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
@@ -547,8 +546,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
-
+    return data.load_checkpoint(src, model, optimizer)
 
 def get_tokenizer(
     vocab: dict[int, bytes],

@@ -48,9 +48,10 @@ def gradient_clipping(params: Iterable[torch.Tensor], max_grad_norm: float):
     eps = 1e-6
     grads = [p.grad for p in params if p.grad is not None]
     if len(grads) == 0:
-        return
+        return torch.tensor(0.0)
     total_norm = torch.sqrt(sum((g.detach() ** 2).sum() for g in grads))
     if total_norm > max_grad_norm:
         scale = max_grad_norm / (total_norm + eps)
         for g in grads:
             g.detach().mul_(scale)
+    return total_norm
