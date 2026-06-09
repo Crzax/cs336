@@ -1,8 +1,4 @@
 #!/bin/bash
-# 在项目根目录执行：
-#   cd /home/crzaxchen/336/assignment1-basics
-#   ./cs336_basics/runs/sweep_lr_coarse.sh
-
 
 COMMON_ARGS="
     --train_data data/TinyStoriesV2-GPT4-train.npy

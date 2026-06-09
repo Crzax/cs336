@@ -44,7 +44,16 @@ def get_args():
     p.add_argument("--num_heads",      type=int, default=16)
     p.add_argument("--d_ff",           type=int, default=None,
                    help="default = round(8/3 * d_model) to a multiple of 64")
-    p.add_argument("--rope_theta",     type=float, default=10000.0)
+    p.add_argument("--rope_theta",     type=float, default=10000.0,
+                   help="RoPE base; pass 0 to disable position encoding (NoPE)")
+    p.add_argument("--no_rmsnorm",     action="store_true",
+                   help="ablation: replace all RMSNorm with Identity")
+    p.add_argument("--norm_position",  type=str, default="pre",
+                   choices=["pre", "post"],
+                   help="pre-norm (default) vs post-norm Transformer block")
+    p.add_argument("--ffn_type",       type=str, default="swiglu",
+                   choices=["swiglu", "silu"],
+                   help="swiglu (3-matrix gated, default) vs silu (2-matrix non-gated)")
     # optim
     p.add_argument("--batch_size",   type=int,   default=32)
     p.add_argument("--total_steps",  type=int,   default=5000)
@@ -133,8 +142,12 @@ def main():
     model = TransformerLM(
         d_model=args.d_model, num_layers=args.num_layers, num_heads=args.num_heads,
         d_ff=args.d_ff, vocab_size=args.vocab_size,
-        max_seq_len=args.context_length, theta=args.rope_theta,
+        max_seq_len=args.context_length,
+        theta=args.rope_theta if args.rope_theta > 0 else None,
         device=device, dtype=dtype,
+        use_rmsnorm=not args.no_rmsnorm,
+        norm_position=args.norm_position,
+        ffn_type=args.ffn_type,
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] {n_params/1e6:.2f}M params")
@@ -200,8 +213,9 @@ def main():
         # (f) 日志（满足要求 4）
         if step % args.log_interval == 0:
             tok_per_step = args.batch_size * args.context_length
+            tokens_seen = tok_per_step * (step - start_step + 1)   
             wall_time_s = time.time() - t0
-            tps = tok_per_step * (step - start_step + 1) / max(wall_time_s, 1e-9)
+            tps = tokens_seen / max(wall_time_s, 1e-9)
             gn = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
             msg = (f"step {step:>6d}  t {wall_time_s:>7.1f}s  lr {lr_now:.2e}  "
                    f"train_loss {loss.item():.4f}  ppl {math.exp(min(loss.item(), 20)):.2f}  "
@@ -214,6 +228,7 @@ def main():
                     "train/lr":        lr_now,
                     "train/grad_norm": gn,
                     "train/tok_per_s": tps,
+                    "tokens_seen":     tokens_seen,
                     "wall_time_s":     wall_time_s,
                 }, step=step)
 
@@ -226,6 +241,7 @@ def main():
                 wandb.log({
                     "val/loss":    val_loss,
                     "val/ppl":     val_ppl,
+                    "tokens_seen": args.batch_size * args.context_length * (step - start_step + 1),
                     "wall_time_s": time.time() - t0,
                 }, step=step)
 

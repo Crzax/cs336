@@ -1,19 +1,22 @@
 #!/bin/bash
-# 用 TinyStories 上训好的 v4 模型生成文本
-# 必须从项目根 ..../336/assignment1-basics 执行
+# OWT 模型推理
+# 用法: bash scripts/infer_owt.sh "Your prompt here" [LR_TAG]
 
-CKPT=runs/exp_final_v4/final.pt
 PROMPT=${1:-"The economic theory of marginal utility states that"}
+LR_TAG=${2:-1.5e-2}
+CKPT=runs/owt_lr${LR_TAG}/final.pt
+
+cd /mnt/cephfs/user_crzaxchen/336/assignment1-basics
 
 python -m cs336_basics.infer \
     --ckpt   "$CKPT" \
-    --vocab  vocab_ts.json \
-    --merges merges_ts.txt \
+    --vocab  vocab_owt.json \
+    --merges merges_owt.txt \
     --prompt "$PROMPT" \
-    --max_new_tokens 200 \
+    --max_new_tokens 256 \
     --temperature 0.8 \
     --top_p 0.9 \
-    --vocab_size 10000 --context_length 256 \
+    --vocab_size 32000 --context_length 256 \
     --d_model 512 --num_layers 4 --num_heads 16 --d_ff 1344 \
     --rope_theta 10000.0 \
     --eot_token "<|endoftext|>" \
