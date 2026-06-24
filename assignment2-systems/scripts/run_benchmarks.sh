@@ -27,6 +27,8 @@ CONFIGS=(
 )
 
 RUN_TYPES=(forward forward_backward full)
+# "" = full precision (fp32), "--mixed_precision" = BF16 autocast
+PRECISIONS=("" "--mixed_precision")
 
 : > "$OUT"
 echo "Writing results to $OUT"
@@ -38,22 +40,26 @@ cd "$PROJECT_DIR"
 for cfg in "${CONFIGS[@]}"; do
   read -r SIZE D_MODEL D_FF N_LAYERS N_HEADS <<< "$cfg"
   for RT in "${RUN_TYPES[@]}"; do
-    echo "==================================================================" | tee -a "$OUT"
-    echo ">>> size=${SIZE}  run_type=${RT}" | tee -a "$OUT"
-    echo "    d_model=${D_MODEL} d_ff=${D_FF} num_layers=${N_LAYERS} num_heads=${N_HEADS}" \
-      | tee -a "$OUT"
+    for AMP in "${PRECISIONS[@]}"; do
+      LABEL="fp32"; [ -n "$AMP" ] && LABEL="bf16"
+      echo "==================================================================" | tee -a "$OUT"
+      echo ">>> size=${SIZE}  run_type=${RT}  precision=${LABEL}" | tee -a "$OUT"
+      echo "    d_model=${D_MODEL} d_ff=${D_FF} num_layers=${N_LAYERS} num_heads=${N_HEADS}" \
+        | tee -a "$OUT"
 
-    # Don't kill the whole sweep if OOM hits on xl/10B.
-    if ! "${RUNNER[@]}" "$SCRIPT_REL" \
-        --warmup "$WARMUP" \
-        --steps "$STEPS" \
-        --run_type "$RT" \
-        --d_model "$D_MODEL" \
-        --d_ff "$D_FF" \
-        --num_layers "$N_LAYERS" \
-        --num_heads "$N_HEADS" 2>&1 | tee -a "$OUT"; then
-      echo "    [FAILED]  size=${SIZE} run_type=${RT} (non-zero exit, see traceback above)" | tee -a "$OUT"
-    fi
+      # Don't kill the whole sweep if OOM hits on xl/10B.
+      if ! "${RUNNER[@]}" "$SCRIPT_REL" \
+          --warmup "$WARMUP" \
+          --steps "$STEPS" \
+          --run_type "$RT" \
+          --d_model "$D_MODEL" \
+          --d_ff "$D_FF" \
+          --num_layers "$N_LAYERS" \
+          --num_heads "$N_HEADS" \
+          $AMP 2>&1 | tee -a "$OUT"; then
+        echo "    [FAILED]  size=${SIZE} run_type=${RT} precision=${LABEL} (non-zero exit)" | tee -a "$OUT"
+      fi
+    done
   done
 done
 
