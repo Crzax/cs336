@@ -40,11 +40,19 @@ MODELS=(
 CONTEXT_LENGTHS=(${CTX:-256 512 2048})
 
 # nsys flags shared by every run.
+# MEM=1 turns on CUDA memory tracking (needed for the per-block activation /
+# gradient memory analysis). Adds a moderate amount of profile overhead.
+MEM_FLAGS=()
+if [ "${MEM:-0}" = "1" ]; then
+  MEM_FLAGS+=(--cuda-memory-usage=true)
+fi
+
 NSYS_FLAGS=(
   --trace=cuda,nvtx,osrt,cudnn,cublas
   --capture-range=cudaProfilerApi
   --capture-range-end=stop
   --force-overwrite=true
+  "${MEM_FLAGS[@]}"
 )
 
 cd "$PROJECT_DIR"

@@ -77,14 +77,26 @@ def run_one_step(model, opt, x, y, run_type: str, amp_ctx, fwd_ctx=None):
     with nvtx.range("forward"), fwd_ctx, amp_ctx:
         logits = model(x)
         if run_type == "forward":
+            # Ensure the forward NVTX range covers the actual GPU work,
+            # not just the kernel launches (important when profiling under nsys).
+            if logits.is_cuda:
+                torch.cuda.synchronize(logits.device)
             return
         loss = cross_entropy(logits, y)
     opt.zero_grad(set_to_none=True)
     with nvtx.range("backward"):
         loss.backward()
+        # `loss.backward()` enqueues work onto an autograd worker thread and
+        # returns immediately. Without an explicit synchronize, the NVTX range
+        # (and any nsys `--capture-range` stop) can end before the GPU kernels
+        # have actually run, producing a misleading <1us "backward" block.
+        if loss.is_cuda:
+            torch.cuda.synchronize(loss.device)
     if run_type == "full":
         with nvtx.range("optimizer"):
             opt.step()
+            if loss.is_cuda:
+                torch.cuda.synchronize(loss.device)
 
 
 def run_memory_profile(model, opt, x, y, args, device, amp_ctx, fwd_ctx=None):

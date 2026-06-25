@@ -379,13 +379,16 @@ class TransformerBlock(nn.Module):
         """
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
-        # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
-        attn_sublayer_output = x + x_attn
+        with nvtx.range("TransformerBlock"):
+            # Apply the multi-head self-attention sublayer
+            with nvtx.range("attn_sublayer"):
+                x_attn = self.attn(self.ln1(x))
+                attn_sublayer_output = x + x_attn
 
-        # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
-        ffn_sublayer_output = attn_sublayer_output + x_ffn
+            # Apply the feed-forward sublayer
+            with nvtx.range("ffn_sublayer"):
+                x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+                ffn_sublayer_output = attn_sublayer_output + x_ffn
         return ffn_sublayer_output
 
 
