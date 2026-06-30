@@ -9,11 +9,41 @@ from contextlib import nullcontext
 
 import torch
 import torch.cuda.nvtx as nvtx
+from torch.utils.checkpoint import checkpoint
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
 
+
+def apply_segmented_checkpointing(model: BasicsTransformerLM, segment_size: int) -> None:
+    if segment_size is None or segment_size <= 0:
+        return
+
+    blocks = list(model.layers)
+    n = len(blocks)
+    if segment_size > n:
+        raise ValueError(f"segment_size={segment_size} > num_layers={n}")
+
+    class _Segment(torch.nn.Module):
+        def __init__(self, segment_blocks):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(segment_blocks)
+
+        def _run(self, x):
+            for blk in self.blocks:
+                x = blk(x)
+            return x
+
+        def forward(self, x):
+            # use_reentrant=False is the modern, hook-based implementation.
+            return checkpoint(self._run, x, use_reentrant=False)
+
+    segments = [
+        _Segment(blocks[i : i + segment_size])
+        for i in range(0, n, segment_size)
+    ]
+    model.layers = torch.nn.ModuleList(segments)
 
 RUN_TYPES = ("forward", "forward_backward", "full")
 
@@ -57,6 +87,13 @@ def get_args():
         type=str,
         default=None,
         help="Output path for the memory snapshot pickle (default auto-named under reports/mem).",
+    )
+    p.add_argument(
+        "--checkpoint_segment",
+        type=int,
+        default=0,
+        help="If > 0, wrap every N consecutive transformer blocks in a single "
+             "torch.utils.checkpoint() call (no nesting). 0 = no checkpointing.",
     )
     return p.parse_args()
 
@@ -129,9 +166,10 @@ def run_memory_profile(model, opt, x, y, args, device, amp_ctx, fwd_ctx=None):
 
     peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
     precision = "bf16" if args.mixed_precision else "fp32"
+    seg = args.checkpoint_segment
     print(
         f"[memory_profile run_type={args.run_type} precision={precision} "
-        f"ctx={args.context_length}] steps={args.steps} "
+        f"ctx={args.context_length} ckpt_seg={seg}] steps={args.steps} "
         f"peak_allocated={peak:.2f} GiB"
     )
     print(f"  snapshot -> {out_path}")
@@ -150,6 +188,9 @@ def main():
         num_layers=args.num_layers,
         num_heads=args.num_heads,
     ).to(device)
+
+    # Optional flat (non-nested) gradient checkpointing on the block stack.
+    apply_segmented_checkpointing(model, args.checkpoint_segment)
 
     # Optimizer is built ONCE outside the loop so its state isn't reset.
     opt = AdamW(model.parameters())
