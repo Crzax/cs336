@@ -95,6 +95,8 @@ def get_args():
         help="If > 0, wrap every N consecutive transformer blocks in a single "
              "torch.utils.checkpoint() call (no nesting). 0 = no checkpointing.",
     )
+    p.add_argument("--compile", action="store_true")
+
     return p.parse_args()
 
 
@@ -192,6 +194,9 @@ def main():
     # Optional flat (non-nested) gradient checkpointing on the block stack.
     apply_segmented_checkpointing(model, args.checkpoint_segment)
 
+    if args.compile:
+        model = torch.compile(model)
+        
     # Optimizer is built ONCE outside the loop so its state isn't reset.
     opt = AdamW(model.parameters())
     x, y = get_random_batch(args, device)
