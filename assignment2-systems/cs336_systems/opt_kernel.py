@@ -3,6 +3,22 @@ from einops import einsum
 import triton
 import triton.language as tl
 
+
+def _pick_tile(seq_len: int, d: int = 64, dtype=torch.float32) -> int:
+    # head dim 越大，tile x d 占的共享内存越多；tl.dot 要求维度 >= 16，
+    # tile 不超过序列长度。fp32 每元素 4B，d=128 时 tile=64 会超 shared memory，
+    # 需收缩到 32；bf16 每元素 2B，占用减半，d=128 仍可用 tile=64。
+    if seq_len >= 128:
+        tile = 64
+    elif seq_len >= 64:
+        tile = 32
+    else:
+        tile = 16
+    # 仅 fp32（4 字节）在 d>=128 时才需要压缩 tile 以避免共享内存溢出
+    if d >= 128 and dtype == torch.float32:
+        tile = min(tile, 32)
+    return min(tile, seq_len)
+
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
@@ -244,8 +260,8 @@ def flash_bwd_dkdv_kernel(
         Di = tl.sum(d_out * O, axis=1)
         dPij = tl.dot(d_out, V.T)
         dSij = Pij * (dPij - Di[:, None])
-        dVj = tl.dot(Pij.T, d_out, dVj)
-        dKj = tl.dot(dSij.T, Qi, dKj)
+        dVj = tl.dot(Pij.T.to(d_out.dtype), d_out, dVj)
+        dKj = tl.dot(dSij.T.to(Qi.dtype), Qi, dKj)
         Q_block_ptr = tl.advance(Q_block_ptr, (Q_TILE_SIZE, 0))
         d_out_block_ptr = tl.advance(d_out_block_ptr, (Q_TILE_SIZE, 0))
         L_block_ptr = tl.advance(L_block_ptr, (Q_TILE_SIZE,))
@@ -359,7 +375,7 @@ def flash_bwd_dq_kernel(
         Pij = tl.exp(Sij - Li[:, None])
         dPij = tl.dot(d_out, Vj.T)
         dSij = Pij * (dPij - Di[:, None])
-        dQij = tl.dot(dSij, Kj, dQij)
+        dQij = tl.dot(dSij.to(Kj.dtype), Kj, dQij)
         K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
         V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
 
@@ -381,11 +397,12 @@ class FlashAttnFuncTriton(torch.autograd.Function):
         bs, nq, d = Q.shape
         bs, nk, d = K.shape
         O = torch.empty_like(Q)
-        L = torch.empty((bs, nq), device=Q.device, dtype=Q.dtype)
-        q_tile_size = 16
-        k_tile_size = 16
-        
-        flash_fwd_kernel[triton.cdiv(nq, q_tile_size), bs] (
+        # L (log-sum-exp) 数值敏感，始终用 fp32 存储，与 dtype 无关
+        L = torch.empty((bs, nq), device=Q.device, dtype=torch.float32)
+        q_tile_size = _pick_tile(nq, d, Q.dtype)
+        k_tile_size = _pick_tile(nk, d, Q.dtype)
+
+        flash_fwd_kernel[(triton.cdiv(nq, q_tile_size), bs)] (
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2),
@@ -411,8 +428,8 @@ class FlashAttnFuncTriton(torch.autograd.Function):
         dQ = torch.empty_like(Q)
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
-        q_tile_size = 16
-        k_tile_size = 16
+        q_tile_size = _pick_tile(nq, d, Q.dtype)
+        k_tile_size = _pick_tile(nk, d, Q.dtype)
         flash_bwd_dkdv_kernel[(triton.cdiv(nk, k_tile_size), bs)](
             L, Q, K, V, O, d_out,
             dQ, dK, dV,
