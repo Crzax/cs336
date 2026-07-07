@@ -22,12 +22,12 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def worker(rank, world_size, ret_dict):
+def worker(rank, world_size, ret_dict, flat):
     setup(rank, world_size)
 
     device = f"cuda:{rank}"
     _model = BasicsTransformerLM(VOCAB, CTX, **XL).to(device)
-    model = DDP(_model)
+    model = DDP(_model, flat=flat)
     opt = AdamW(model.parameters())
 
     local_bs = GLOBAL_BS // world_size
@@ -52,9 +52,7 @@ def worker(rank, world_size, ret_dict):
         opt.zero_grad(set_to_none=True)
         loss = cross_entropy(model(x), y)
         loss.backward()
-        comm_start.record()
-        model.finish_gradient_synchronization()
-        comm_end.record()
+        model.finish_gradient_synchronization(comm_start, comm_end)
 
         opt.step()
         step_end.record()
@@ -86,7 +84,7 @@ if __name__ == "__main__":
 
     mp.spawn(
         worker,
-        args=(2, return_dict),
+        args=(2, return_dict, True),
         nprocs=2,
         join=True,
     )

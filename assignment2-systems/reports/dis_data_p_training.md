@@ -9,3 +9,7 @@ size(MB)\GPUs |          2 |          4 |          6
 
 # Problem (naive_ddp_benchmarking): Naïve DDP Benchmarking 
 step_max=1115.265 ms, comm_max=63.748 ms, comm_ratio=0.057
+
+# Problem (minimal_ddp_flat_benchmarking): Minimal DDP with Flat Gradients Benchmarking
+step_max=1119.685 ms, comm_max=50.251 ms, comm_ratio=0.045
+
