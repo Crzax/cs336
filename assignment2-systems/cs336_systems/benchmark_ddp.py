@@ -5,6 +5,7 @@ import torch.multiprocessing as mp
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
+from cs336_systems.dist_train import DDP
 
 XL = dict(d_model=2560, d_ff=10240, num_layers=32, num_heads=32)
 VOCAB, CTX, GLOBAL_BS = 10000, 512, 4
@@ -25,28 +26,20 @@ def worker(rank, world_size, ret_dict):
     setup(rank, world_size)
 
     device = f"cuda:{rank}"
-    model = BasicsTransformerLM(VOCAB, CTX, **XL).to(device)
+    _model = BasicsTransformerLM(VOCAB, CTX, **XL).to(device)
+    model = DDP(_model)
     opt = AdamW(model.parameters())
-    
-    for tensor in model.state_dict().values():
-        dist.broadcast(tensor, src=0)
 
     local_bs = GLOBAL_BS // world_size
     x = torch.randint(VOCAB, (local_bs, CTX), device=device)
     y = torch.randint(VOCAB, (local_bs, CTX), device=device)
-
-    def all_reduce_grads():
-        for p in model.parameters():
-            if p.requires_grad:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, async_op=False)
-                p.grad /= world_size
 
     # ---- warmup ----
     for _ in range(WARMUP):
         opt.zero_grad(set_to_none=True)
         loss = cross_entropy(model(x), y)
         loss.backward()
-        all_reduce_grads()
+        model.finish_gradient_synchronization()
         opt.step()
     torch.cuda.synchronize()
 
@@ -60,7 +53,7 @@ def worker(rank, world_size, ret_dict):
         loss = cross_entropy(model(x), y)
         loss.backward()
         comm_start.record()
-        all_reduce_grads()
+        model.finish_gradient_synchronization()
         comm_end.record()
 
         opt.step()
