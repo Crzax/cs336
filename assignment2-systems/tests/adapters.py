@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 from cs336_systems.opt_kernel import FlashAttnFunc, FlashAttnFuncTriton
-from cs336_systems.dist_train import DDP, AsyncDDP
+from cs336_systems.dist_train import DDP, AsyncDDP, StateShardingOptimizer
 
 def get_flashattention_autograd_function_pytorch() -> type:
     """
@@ -132,4 +132,4 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return StateShardingOptimizer(params, optimizer_cls, **kwargs)
