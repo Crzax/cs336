@@ -115,3 +115,171 @@ class StateShardingOptimizer(Optimizer):
             dist.broadcast(p.data, src=owner)
 
         return loss
+
+class FSDP(torch.nn.Module):
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        compute_dtype: torch.dtype | None = None,
+        prefetch: int = 2,
+    ):
+        super().__init__()
+        self.module = module
+        self.compute_dtype = compute_dtype
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+
+        self.prefetch_depth = int(prefetch)
+        self._sharded_modules: list[torch.nn.Module] = []
+        self._fwd_pos: dict[torch.nn.Module, int] = {}
+        self._inflight: dict = {}
+
+        for tensor in self.module.state_dict().values():
+            dist.broadcast(tensor, src=0)
+
+        from cs336_basics.model import Embedding, Linear
+
+        self._sharded_params: list[torch.nn.Parameter] = []
+        for m in self.module.modules():
+            if isinstance(m, (Linear, Embedding)) and getattr(m, "weight", None) is not None:
+                self._shard_module(m)
+
+    def _shard_module(self, m: torch.nn.Module):
+        param = m.weight
+        orig_shape = tuple(param.shape)
+        numel = param.numel()
+        ws = self.world_size
+
+        pad = (ws - numel % ws) % ws
+        shard_size = (numel + pad) // ws
+
+        flat = param.data.reshape(-1)
+        if pad:
+            flat = torch.cat([flat, flat.new_zeros(pad)])
+        start = self.rank * shard_size
+        shard = flat[start : start + shard_size].clone()  
+
+        param.data = shard
+        param._fsdp_is_sharded = True
+        param._fsdp_master = param.data
+        param._fsdp_meta = (orig_shape, numel, pad, shard_size)
+
+        m.register_forward_pre_hook(self._pre_forward)
+        m.register_forward_hook(self._post_forward)
+        m.register_full_backward_pre_hook(self._pre_backward)
+        param.register_post_accumulate_grad_hook(self._post_grad)
+
+        self._fwd_pos[m] = len(self._sharded_modules)
+        self._sharded_modules.append(m)
+        self._sharded_params.append(param)
+
+    def _gather_full(self, param: torch.nn.Parameter) -> torch.Tensor:
+        orig_shape, numel, pad, shard_size = param._fsdp_meta
+        master = param._fsdp_master
+        compute_shard = master if self.compute_dtype is None else master.to(self.compute_dtype)
+        compute_shard = compute_shard.contiguous()
+
+        gathered = [torch.empty_like(compute_shard) for _ in range(self.world_size)]
+        with torch.cuda.nvtx.range("fsdp.all_gather_weight"):
+            dist.all_gather(gathered, compute_shard)
+        full_flat = torch.cat(gathered)
+        return full_flat[:numel].reshape(orig_shape)
+
+    def _async_gather(self, module):
+        if module in self._inflight:
+            return
+        p = module.weight
+        orig_shape, numel, pad, shard_size = p._fsdp_meta
+        master = p._fsdp_master
+        compute_shard = master if self.compute_dtype is None else master.to(self.compute_dtype)
+        compute_shard = compute_shard.contiguous()
+        gathered = [torch.empty_like(compute_shard) for _ in range(self.world_size)]
+        with torch.cuda.nvtx.range("fsdp.prefetch_all_gather"):
+            handle = dist.all_gather(gathered, compute_shard, async_op=True)
+        self._inflight[module] = (handle, gathered, compute_shard, orig_shape, numel)
+
+    def _materialize(self, module):
+        p = module.weight
+        if module in self._inflight:
+            handle, gathered, _cs, orig_shape, numel = self._inflight.pop(module)
+            with torch.cuda.nvtx.range("fsdp.wait_all_gather"):
+                handle.wait()
+            p.data = torch.cat(gathered)[:numel].reshape(orig_shape)
+        else:
+            p.data = self._gather_full(p)  
+
+    def _prefetch_next(self, module):
+        i = self._fwd_pos.get(module)
+        if i is None:
+            return
+        end = min(i + 1 + self.prefetch_depth, len(self._sharded_modules))
+        for j in range(i + 1, end):
+            self._async_gather(self._sharded_modules[j])
+
+    def _pre_forward(self, module, args):
+        if not self.prefetch_depth:
+            module.weight.data = self._gather_full(module.weight)
+            return
+        self._materialize(module)
+        self._prefetch_next(module)
+
+    def _post_forward(self, module, args, output):
+        p = module.weight
+        p.data = p._fsdp_master  
+
+    def _pre_backward(self, module, grad_output):
+        p = module.weight
+        p.data = self._gather_full(p)
+
+    def _post_grad(self, p):
+        p.data = p._fsdp_master
+
+    def forward(self, *inputs, **kwargs):
+        if self.prefetch_depth:
+            self._inflight.clear()
+            for j in range(min(self.prefetch_depth + 1, len(self._sharded_modules))):
+                self._async_gather(self._sharded_modules[j])
+        return self.module(*inputs, **kwargs)
+
+    def finish_gradient_synchronization(self):
+        ws = self.world_size
+
+        for param in self._sharded_params:
+            if param.grad is None:
+                continue
+            _, numel, pad, shard_size = param._fsdp_meta
+            flat = param.grad.reshape(-1)
+            if pad:
+                flat = torch.cat([flat, flat.new_zeros(pad)])
+            else:
+                flat = flat.contiguous()
+
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            flat /= ws
+
+            start = self.rank * shard_size
+            shard_grad = flat[start : start + shard_size].clone().to(param._fsdp_master.dtype)
+            param.grad = shard_grad
+            param.data = param._fsdp_master  
+
+        for param in self.module.parameters():
+            if getattr(param, "_fsdp_is_sharded", False):
+                continue
+            if param.grad is None:
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad /= ws
+
+    def gather_full_params(self) -> dict[str, torch.Tensor]:
+        result: dict[str, torch.Tensor] = {}
+        for name, param in self.module.named_parameters():
+            if getattr(param, "_fsdp_is_sharded", False):
+                orig_shape, numel, _, _ = param._fsdp_meta
+                master = param._fsdp_master.contiguous()
+                gathered = [torch.empty_like(master) for _ in range(self.world_size)]
+                dist.all_gather(gathered, master)
+                full_flat = torch.cat(gathered)
+                result[name] = full_flat[:numel].reshape(orig_shape)
+            else:
+                result[name] = param.data
+        return result
