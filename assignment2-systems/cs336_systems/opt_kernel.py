@@ -4,6 +4,42 @@ import triton
 import triton.language as tl
 
 
+# ---------------------------------------------------------------------------
+# Autotune configs（#5）
+# ---------------------------------------------------------------------------
+# 三个 kernel 独立 autotune：fwd 与 dq 都按 Q 并行内循环 K，dkdv 反过来。
+# 挑 pareto 前沿 6 组，避开 shared memory 溢出与低 SM 占用两个极端：
+#   - Q_TILE / K_TILE ∈ {32, 64, 128}：太小 SM 利用不足；太大 shared memory 溢出。
+#   - num_warps ∈ {4, 8}
+#   - num_stages ∈ {2, 3}：Hopper 上 async pipeline 深度；反向 kernel 载入 5 个 tensor（K/V/Q/dO/O）
+#     + fp32 accumulator，num_stages=3 会把 buffer 复制 3 份，shared memory 逼近 SM 上限 228KB，
+#     大 tile 组合下容易 illegal memory access。反向一律用 num_stages=2 稳妥。
+# key 是 (N_QUERIES, N_KEYS, D, is_causal)——决定最优 config 的所有维度，dtype 由 constexpr 自动特化。
+_FWD_CONFIGS = [
+    triton.Config({'Q_TILE_SIZE': 32,  'K_TILE_SIZE': 32}, num_warps=4, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 32}, num_warps=4, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 32}, num_warps=4, num_stages=3),
+    triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 64}, num_warps=4, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 64}, num_warps=4, num_stages=3),
+    triton.Config({'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 64}, num_warps=8, num_stages=2),
+]
+# 反向 dq 与 fwd 结构相同（按 Q 并行），但反向内循环还要载入 Vj/dOi/Li，寄存器压力更大——
+# 沿用同一批 config，但去掉最大 tile + 高 stages 的极端组合（fwd 里也已剔除）。
+_BWD_DQ_CONFIGS = _FWD_CONFIGS
+# 反向 dkdv 按 K 并行、外循环 Q，K_TILE 决定 program 数量（越大 program 越少），
+# 但 K/V 是持久 tile（不换），Q/dO/O/L 是流式载入——K_TILE 太大反而寄存器紧张。
+# 一律 num_stages=2 避免 buffer 3 份触发 shmem 越界（seq=32768 下亲测大 tile+3 stages 崩）。
+_BWD_DKDV_CONFIGS = [
+    triton.Config({'Q_TILE_SIZE': 32,  'K_TILE_SIZE': 32},  num_warps=4, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 32,  'K_TILE_SIZE': 64},  num_warps=4, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 64},  num_warps=4, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 64},  num_warps=8, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 32,  'K_TILE_SIZE': 128}, num_warps=8, num_stages=2),
+    triton.Config({'Q_TILE_SIZE': 64,  'K_TILE_SIZE': 128}, num_warps=8, num_stages=2),
+]
+_AUTOTUNE_KEY = ['N_QUERIES', 'N_KEYS', 'D', 'is_causal']
+
+
 def _pick_tile(seq_len: int, d: int = 64, dtype=torch.float32) -> int:
     # head dim 越大，tile x d 占的共享内存越多；tl.dot 要求维度 >= 16，
     # tile 不超过序列长度。fp32 每元素 4B，d=128 时 tile=64 会超 shared memory，
@@ -80,6 +116,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return torch.compile(_backward)()
         
 
+@triton.autotune(configs=_FWD_CONFIGS, key=_AUTOTUNE_KEY)
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -126,17 +163,47 @@ def flash_fwd_kernel(
             block_shape=(K_TILE_SIZE, D),
             order=(1, 0),
         )
-    for key_tile_index in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    # causal 下 K tile 分三类（#3 跳纯 0 tile + #4 L/D 分离）：
+    #   1. 纯下三角块（K tile 最大 key <= Q tile 最小 query）：结果全合法，无需 mask。
+    #   2. 对角块（Q/K tile 骑跨对角线）：需要逐元素 q>=k 比较 + where。
+    #   3. 纯上三角块（K tile 最小 key > Q tile 最大 query）：全 0，直接不迭代（#3）。
+    # 前向按 query tile 并行，本 Q tile 最小 query = qt*Q_TILE，最大 query = (qt+1)*Q_TILE-1。
+    #   - 纯下三角块条件：(kt+1)*K_TILE - 1 <= qt*Q_TILE，即 kt < qt*Q_TILE/K_TILE（下取整）。
+    #     故非对角块个数 = qt*Q_TILE // K_TILE。
+    #   - 对角块最多需要迭代到覆盖 (qt+1)*Q_TILE-1 的 K tile，即 cdiv((qt+1)*Q_TILE, K_TILE)。
+    # 分成两段循环：非对角段完全无 mask（编译器可生成纯 GEMM 无分支）；对角段仅少量 tile 走 mask。
+    if is_causal:
+        n_full_tiles = (query_tile_index * Q_TILE_SIZE) // K_TILE_SIZE
+        n_total_tiles = tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE)
+    else:
+        n_full_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+        n_total_tiles = n_full_tiles
+    # 段 1：非对角块（无 mask，纯 GEMM）
+    for key_tile_index in range(n_full_tiles):
         Kj = tl.load(K_block_ptr, boundary_check=(0,1), padding_option='zero')
         Vj = tl.load(V_block_ptr, boundary_check=(0,1), padding_option='zero')
         Sij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
         Sij = tl.dot(Qi, Kj.T, Sij) * scale
-        if is_causal:
-            q_pos = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
-            k_pos = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
-            mask = q_pos[:, None] >= k_pos[None, :]      # [bq, bk]，允许 q>=k
-            Sij = tl.where(mask, Sij, -1e6)
-
+        mij = tl.maximum(mi, tl.max(Sij, axis=1))
+        Pi = tl.exp(Sij - mij[:, None])
+        lij = tl.exp(mi - mij) * li + tl.sum(Pi, axis=1)
+        Oi = tl.exp(mi - mij)[:, None] * Oi
+        Pi = Pi.to(Vj.dtype)
+        Oi = tl.dot(Pi, Vj, Oi)
+        li = lij
+        mi = mij
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+    # 段 2：对角块（有 mask）；非 causal 时 n_total_tiles == n_full_tiles，循环空转
+    for key_tile_index in range(n_full_tiles, n_total_tiles):
+        Kj = tl.load(K_block_ptr, boundary_check=(0,1), padding_option='zero')
+        Vj = tl.load(V_block_ptr, boundary_check=(0,1), padding_option='zero')
+        Sij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
+        Sij = tl.dot(Qi, Kj.T, Sij) * scale
+        q_pos = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
+        k_pos = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
+        mask = q_pos[:, None] >= k_pos[None, :]      # [bq, bk]，允许 q>=k
+        Sij = tl.where(mask, Sij, -1e6)
         mij = tl.maximum(mi, tl.max(Sij, axis=1))
         Pi = tl.exp(Sij - mij[:, None])
         lij = tl.exp(mi - mij) * li + tl.sum(Pi, axis=1)
@@ -172,6 +239,7 @@ def flash_fwd_kernel(
     tl.store(O_block_ptr, Oi, boundary_check=(0, 1))
     tl.store(L_block_ptr, Li, boundary_check=(0,))
 
+@triton.autotune(configs=_BWD_DKDV_CONFIGS, key=_AUTOTUNE_KEY)
 @triton.jit
 def flash_bwd_dkdv_kernel(
     L_ptr, Q_ptr, K_ptr, V_ptr, O_ptr, d_out_ptr,
@@ -211,11 +279,21 @@ def flash_bwd_dkdv_kernel(
         )
     K = tl.load(K_block_ptr, boundary_check=(0,1), padding_option='zero')
     V = tl.load(V_block_ptr, boundary_check=(0,1), padding_option='zero')
+    # causal early stop（此 kernel 按 key tile 并行，反过来跳 query tile）：
+    # 本 K tile 最小 key 下标 = key_tile_index*K_TILE_SIZE；所有 max_q 小于它的
+    # query tile 全 q<k 被 mask，无贡献 → 从含该 key 下标的 query tile 起算。
+    # 起始 query tile = (key_tile_index*K_TILE_SIZE)//Q_TILE_SIZE，并把各 block_ptr
+    # 的初始 offset 直接落到该 tile，省掉前面所有全 0 的迭代。
+    if is_causal:
+        start_query_tile = (key_tile_index * K_TILE_SIZE) // Q_TILE_SIZE
+    else:
+        start_query_tile = 0
+    q_offset = start_query_tile * Q_TILE_SIZE
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(0, 0),
+        offsets=(q_offset, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -223,7 +301,7 @@ def flash_bwd_dkdv_kernel(
         d_out_ptr + batch_index * stride_ob,
         shape=(N_QUERIES, D),
         strides=(stride_oq, stride_od),
-        offsets=(0, 0),
+        offsets=(q_offset, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -231,7 +309,7 @@ def flash_bwd_dkdv_kernel(
         L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES, ),
         strides=(stride_lq, ),
-        offsets=(0, ),
+        offsets=(q_offset, ),
         block_shape=(Q_TILE_SIZE, ),
         order=(0, ),
     )
@@ -239,21 +317,49 @@ def flash_bwd_dkdv_kernel(
         O_ptr + batch_index * stride_ob,
         shape=(N_QUERIES, D),
         strides=(stride_oq, stride_od),
-        offsets=(0, 0),
+        offsets=(q_offset, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
     dKj = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
     dVj = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)
-    for query_tile_index in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
+    # dKdV kernel 按 key tile 并行，Q tile 分三类（反向对称于前向）：
+    #   1. 纯上三角（qt*Q_TILE + Q_TILE - 1 < kt*K_TILE，即 K 在 Q 完全右侧）：全 0，直接不迭代（#3 用 start_query_tile 跳过）。
+    #   2. 对角块（Q/K tile 骑跨对角线）：需要逐元素 mask。
+    #   3. 纯下三角块（qt*Q_TILE >= (kt+1)*K_TILE，即 K 最大 key 严格小于 Q 最小 query）：全保留，无 mask。
+    # 对角块 qt 范围：[start_query_tile, first_full_qt)，其中 first_full_qt = cdiv((kt+1)*K_TILE, Q_TILE)。
+    # 非对角块 qt 范围：[first_full_qt, N_Q_tiles)。
+    n_total_qt = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
+    if is_causal:
+        first_full_qt = tl.cdiv((key_tile_index + 1) * K_TILE_SIZE, Q_TILE_SIZE)
+    else:
+        first_full_qt = start_query_tile  # 非 causal 时全部按无 mask 走
+    # 段 1：对角块（有 mask）；非 causal 时该循环空转
+    for query_tile_index in range(start_query_tile, first_full_qt):
         Qi = tl.load(Q_block_ptr, boundary_check=(0,1), padding_option='zero')
         d_out = tl.load(d_out_block_ptr, boundary_check=(0,1), padding_option='zero')
         Sij = tl.dot(Qi, K.T) * scale
-        if is_causal:
-            q_pos = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
-            k_pos = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
-            mask = q_pos[:, None] >= k_pos[None, :]      # [bq, bk]，允许 q>=k
-            Sij = tl.where(mask, Sij, -1e6)
+        q_pos = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
+        k_pos = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
+        mask = q_pos[:, None] >= k_pos[None, :]      # [bq, bk]，允许 q>=k
+        Sij = tl.where(mask, Sij, -1e6)
+        Li = tl.load(L_block_ptr, boundary_check=(0,))
+        Pij = tl.exp(Sij - Li[:, None])
+        O = tl.load(O_block_ptr, boundary_check=(0,1), padding_option='zero')
+        Di = tl.sum(d_out * O, axis=1)
+        dPij = tl.dot(d_out, V.T)
+        dSij = Pij * (dPij - Di[:, None])
+        dVj = tl.dot(Pij.T.to(d_out.dtype), d_out, dVj)
+        dKj = tl.dot(dSij.T.to(Qi.dtype), Qi, dKj)
+        Q_block_ptr = tl.advance(Q_block_ptr, (Q_TILE_SIZE, 0))
+        d_out_block_ptr = tl.advance(d_out_block_ptr, (Q_TILE_SIZE, 0))
+        L_block_ptr = tl.advance(L_block_ptr, (Q_TILE_SIZE,))
+        O_block_ptr = tl.advance(O_block_ptr, (Q_TILE_SIZE, 0))
+    # 段 2：非对角块（无 mask，纯 GEMM）
+    for query_tile_index in range(first_full_qt, n_total_qt):
+        Qi = tl.load(Q_block_ptr, boundary_check=(0,1), padding_option='zero')
+        d_out = tl.load(d_out_block_ptr, boundary_check=(0,1), padding_option='zero')
+        Sij = tl.dot(Qi, K.T) * scale
         Li = tl.load(L_block_ptr, boundary_check=(0,))
         Pij = tl.exp(Sij - Li[:, None])
         O = tl.load(O_block_ptr, boundary_check=(0,1), padding_option='zero')
@@ -288,6 +394,7 @@ def flash_bwd_dkdv_kernel(
     tl.store(dK_block_ptr, dKj, boundary_check=(0, 1))
     tl.store(dV_block_ptr, dVj, boundary_check=(0, 1))
 
+@triton.autotune(configs=_BWD_DQ_CONFIGS, key=_AUTOTUNE_KEY)
 @triton.jit
 def flash_bwd_dq_kernel(
     L_ptr, Q_ptr, K_ptr, V_ptr, O_ptr, d_out_ptr,
@@ -363,15 +470,33 @@ def flash_bwd_dq_kernel(
     Qi = tl.load(Q_block_ptr, boundary_check=(0,1), padding_option='zero')
     Li = tl.load(L_block_ptr, boundary_check=(0,))
     dQij = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    for key_tile_index in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    # causal L/D 分离：非对角块无 mask（纯 GEMM），对角块少量 tile 走 mask。切分同前向。
+    if is_causal:
+        n_full_tiles = (query_tile_index * Q_TILE_SIZE) // K_TILE_SIZE
+        n_total_tiles = tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE)
+    else:
+        n_full_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+        n_total_tiles = n_full_tiles
+    # 段 1：非对角块（无 mask）
+    for key_tile_index in range(n_full_tiles):
         Kj = tl.load(K_block_ptr, boundary_check=(0,1), padding_option='zero')
         Vj = tl.load(V_block_ptr, boundary_check=(0,1), padding_option='zero')
         Sij = tl.dot(Qi, Kj.T) * scale
-        if is_causal:
-            q_pos = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
-            k_pos = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
-            mask = q_pos[:, None] >= k_pos[None, :]      # [bq, bk]，允许 q>=k
-            Sij = tl.where(mask, Sij, -1e6)
+        Pij = tl.exp(Sij - Li[:, None])
+        dPij = tl.dot(d_out, Vj.T)
+        dSij = Pij * (dPij - Di[:, None])
+        dQij = tl.dot(dSij.to(Kj.dtype), Kj, dQij)
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+    # 段 2：对角块（有 mask）
+    for key_tile_index in range(n_full_tiles, n_total_tiles):
+        Kj = tl.load(K_block_ptr, boundary_check=(0,1), padding_option='zero')
+        Vj = tl.load(V_block_ptr, boundary_check=(0,1), padding_option='zero')
+        Sij = tl.dot(Qi, Kj.T) * scale
+        q_pos = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
+        k_pos = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
+        mask = q_pos[:, None] >= k_pos[None, :]      # [bq, bk]，允许 q>=k
+        Sij = tl.where(mask, Sij, -1e6)
         Pij = tl.exp(Sij - Li[:, None])
         dPij = tl.dot(d_out, Vj.T)
         dSij = Pij * (dPij - Di[:, None])
@@ -399,10 +524,10 @@ class FlashAttnFuncTriton(torch.autograd.Function):
         O = torch.empty_like(Q)
         # L (log-sum-exp) 数值敏感，始终用 fp32 存储，与 dtype 无关
         L = torch.empty((bs, nq), device=Q.device, dtype=torch.float32)
-        q_tile_size = _pick_tile(nq, d, Q.dtype)
-        k_tile_size = _pick_tile(nk, d, Q.dtype)
 
-        flash_fwd_kernel[(triton.cdiv(nq, q_tile_size), bs)] (
+        # grid 用 lambda 接受 META（autotune 选中的 config），保证 program 数量匹配 Q_TILE_SIZE。
+        fwd_grid = lambda META: (triton.cdiv(nq, META['Q_TILE_SIZE']), bs)
+        flash_fwd_kernel[fwd_grid](
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2),
@@ -412,8 +537,6 @@ class FlashAttnFuncTriton(torch.autograd.Function):
             nq, nk,
             1.0 / d**0.5,
             D=d,
-            Q_TILE_SIZE=q_tile_size,
-            K_TILE_SIZE=k_tile_size,
             is_causal=is_causal,
         )
         ctx.save_for_backward(L, Q, K, V, O)
@@ -428,9 +551,9 @@ class FlashAttnFuncTriton(torch.autograd.Function):
         dQ = torch.empty_like(Q)
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
-        q_tile_size = _pick_tile(nq, d, Q.dtype)
-        k_tile_size = _pick_tile(nk, d, Q.dtype)
-        flash_bwd_dkdv_kernel[(triton.cdiv(nk, k_tile_size), bs)](
+
+        dkdv_grid = lambda META: (triton.cdiv(nk, META['K_TILE_SIZE']), bs)
+        flash_bwd_dkdv_kernel[dkdv_grid](
             L, Q, K, V, O, d_out,
             dQ, dK, dV,
             L.stride(0), L.stride(1),
@@ -444,11 +567,10 @@ class FlashAttnFuncTriton(torch.autograd.Function):
             nq, nk,
             1.0 / d**0.5,
             D=d,
-            Q_TILE_SIZE=q_tile_size,
-            K_TILE_SIZE=k_tile_size,
             is_causal=ctx.is_causal,
-        ) 
-        flash_bwd_dq_kernel[(triton.cdiv(nq, q_tile_size), bs)](
+        )
+        dq_grid = lambda META: (triton.cdiv(nq, META['Q_TILE_SIZE']), bs)
+        flash_bwd_dq_kernel[dq_grid](
             L, Q, K, V, O, d_out,
             dQ, dK, dV,
             L.stride(0), L.stride(1),
@@ -462,8 +584,6 @@ class FlashAttnFuncTriton(torch.autograd.Function):
             nq, nk,
             1.0 / d**0.5,
             D=d,
-            Q_TILE_SIZE=q_tile_size,
-            K_TILE_SIZE=k_tile_size,
             is_causal=ctx.is_causal,
         )
         return dQ, dK, dV, None
