@@ -122,6 +122,7 @@ class FSDP(torch.nn.Module):
         module: torch.nn.Module,
         compute_dtype: torch.dtype | None = None,
         prefetch: int = 2,
+        skip_modules: "set[torch.nn.Module] | None" = None,
     ):
         super().__init__()
         self.module = module
@@ -133,6 +134,9 @@ class FSDP(torch.nn.Module):
         self._sharded_modules: list[torch.nn.Module] = []
         self._fwd_pos: dict[torch.nn.Module, int] = {}
         self._inflight: dict = {}
+        # 不切分这些 module 的 weight（例如 lm_head：#7 里 fused CE 手动读它的完整
+        # weight, 绕过了 forward hook, 若被切分会拿到残缺分片 → 必须整份保留）。
+        skip_modules = skip_modules or set()
 
         for tensor in self.module.state_dict().values():
             dist.broadcast(tensor, src=0)
@@ -141,6 +145,8 @@ class FSDP(torch.nn.Module):
 
         self._sharded_params: list[torch.nn.Parameter] = []
         for m in self.module.modules():
+            if m in skip_modules:
+                continue
             if isinstance(m, (Linear, Embedding)) and getattr(m, "weight", None) is not None:
                 self._shard_module(m)
 
