@@ -24,10 +24,16 @@ class ModelConfig:
 class TrainingConfig:
     seed: int = 0
     dtype: str = "bfloat16"
-    train_batch_size: int = 128
-    eval_batch_size: int = 128
+    # 原始配置为 train_batch_size=128 / gradient_accumulation_steps=1，
+    # 是为 8xB200(180GB) 设计的。本机是 8xH20(95GB)，显存约为一半，
+    # batch=128 时 logits 张量 [128, 512, 50257] 在 cross_entropy 里转fp32
+    # 需要 ~13GB，加上各层激活会OOM。
+    # 这里改为 batch=32 + grad_accum=4，有效 batch 仍为 32*4=128，
+    # 每步梯度在数学上与原配置等价，只是拆成4 次前向/反向以降低峰值显存。
+    train_batch_size: int = 32
+    eval_batch_size: int = 32
     train_steps: int = 16_384
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 4
     compile: bool = True
     eval_iterations: int = 1_000
     eval_interval: int = 2_000
