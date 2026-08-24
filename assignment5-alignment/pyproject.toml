@@ -27,6 +27,7 @@ gpu = [
     "wandb>=0.26.0",
 ]
 plots = [
+    "matplotlib>=3.9.0",
     "wandb>=0.26.0",
 ]
 
