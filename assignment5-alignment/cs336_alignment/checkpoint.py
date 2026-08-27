@@ -107,7 +107,7 @@ def compute_group_normalized_rewards(
 def compute_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
-    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo", "cispo"] = "none",
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     response_mask: torch.Tensor | None = None,
@@ -122,36 +122,73 @@ def compute_policy_gradient_loss(
     else:
         if old_log_probs is None:
             raise ValueError("old_log_probs is required for importance reweighting")
-        if importance_reweighting_method in ("grpo", "gspo") and cliprange is None:
-            raise ValueError("cliprange is required for 'grpo' and 'gspo'")
+        if importance_reweighting_method in ("grpo", "gspo", "cispo") and cliprange is None:
+            raise ValueError("cliprange is required for 'grpo', 'gspo' and 'cispo'")
 
-        per_token_log_ratio = policy_log_probs - old_log_probs
+        log_ratio = policy_log_probs - old_log_probs
+        cliprange_value = cliprange
 
         if importance_reweighting_method == "gspo":
-            # Sequence-level weight s = exp(mean log-ratio over response tokens), shared across time.
             if response_mask is None:
                 raise ValueError("response_mask is required for 'gspo'")
-            mask = response_mask.to(per_token_log_ratio.dtype)
-            seq_log_ratio = (per_token_log_ratio * mask).sum(dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True)
-            importance_weight = torch.exp(seq_log_ratio)
+
+            # log geometric mean = mean(log pi_theta - log pi_0) over response tokens.
+            response_mask_float = response_mask.to(dtype=log_ratio.dtype)
+            response_lengths = response_mask_float.sum(dim=-1, keepdim=True)
+            if torch.any(response_lengths == 0):
+                raise ValueError("response_mask must contain at least one response token per sequence")
+            sequence_log_ratio = (
+                (log_ratio * response_mask_float).sum(dim=-1, keepdim=True)
+                / response_lengths
+            )
+            importance_weight = torch.exp(sequence_log_ratio)
         else:
-            # Token-level weight w = pi_theta / pi_0.
-            importance_weight = torch.exp(per_token_log_ratio)
+            # Token-level importance weight.
+            importance_weight = torch.exp(log_ratio)
 
         if importance_reweighting_method == "noclip":
             per_token_policy_gradient_loss = -advantages * importance_weight
+        elif importance_reweighting_method == "cispo":
+            # CISPO upper-bound clipping (Eq. 61): g = min(w, 1+eps) * A * grad log pi.
+            # The bounded ratio is a stop-gradient coefficient: upweighted tokens keep a
+            # non-zero gradient capped at (1+eps)*A*grad log pi instead of being frozen.
+            # It must NOT be differentiated through; otherwise an extra A*log(pi)*grad(w)
+            # term appears, amplified by |log pi| ~ 10-100, which destabilizes training.
+            assert cliprange_value is not None
+            upper_bound = 1.0 + cliprange_value
+            bounded_weight = torch.minimum(
+                importance_weight,
+                torch.full_like(importance_weight, upper_bound),
+            ).detach()
+            per_token_policy_gradient_loss = (
+                -advantages * bounded_weight * policy_log_probs
+            )
+            metadata["clip_mask"] = (
+                importance_weight > upper_bound
+            ).to(dtype=policy_log_probs.dtype)
         else:
-            # PPO/GRPO- or GSPO-style clipping:
-            # J = min(A * w, A * clip(w, 1 - eps, 1 + eps)); loss = -J.
-            clipped_weight = importance_weight.clamp(1 - cliprange, 1 + cliprange)
-            objective = torch.minimum(advantages * importance_weight, advantages * clipped_weight)
+            assert cliprange_value is not None
+            clipped_weight = importance_weight.clamp(
+                1.0 - cliprange_value,
+                1.0 + cliprange_value,
+            )
+            objective = torch.minimum(
+                advantages * importance_weight,
+                advantages * clipped_weight,
+            )
             per_token_policy_gradient_loss = -objective
-            # Fraction of positions where the unclipped path is active (i.e., weight got clipped).
-            metadata["clip_mask"] = (advantages * importance_weight != objective).to(policy_log_probs.dtype)
+            metadata["clip_mask"] = (
+                advantages * importance_weight != objective
+            ).to(dtype=policy_log_probs.dtype)
+
             if importance_reweighting_method == "gspo":
-                # Broadcast the sequence-level loss back over tokens for aggregation.
-                per_token_policy_gradient_loss = per_token_policy_gradient_loss.expand_as(policy_log_probs)
-                metadata["clip_mask"] = metadata["clip_mask"].expand_as(policy_log_probs)
+                # The sequence-level objective is shared by all response tokens.
+                per_token_policy_gradient_loss = per_token_policy_gradient_loss.expand_as(
+                    policy_log_probs
+                )
+                metadata["clip_mask"] = metadata["clip_mask"].expand_as(
+                    policy_log_probs
+                )
     return per_token_policy_gradient_loss, metadata
 
 def aggregate_loss_across_microbatch(
@@ -159,6 +196,7 @@ def aggregate_loss_across_microbatch(
     mask: torch.Tensor,
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
+    sequence_normalization_denominator: int | None = None,
 ) -> torch.Tensor:
     masked_loss = per_token_policy_gradient_loss * mask.to(
         dtype=per_token_policy_gradient_loss.dtype
@@ -168,7 +206,10 @@ def aggregate_loss_across_microbatch(
         sequence_lengths = mask.sum(dim=-1).to(
             dtype=per_token_policy_gradient_loss.dtype
         )
-        return (masked_loss.sum(dim=-1) / sequence_lengths).mean()
+        sequence_losses = masked_loss.sum(dim=-1) / sequence_lengths
+        if sequence_normalization_denominator is None:
+            return sequence_losses.mean()
+        return sequence_losses.sum() / sequence_normalization_denominator
 
     if loss_normalization == "constant":
         if normalization_constant is None:
@@ -197,7 +238,7 @@ def grpo_train_step(
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal["std", "none", "mean"] = "std",
     # Importance reweighting and clipping
-    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo", "cispo"] = "none",
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     # Loss normalization
@@ -206,33 +247,73 @@ def grpo_train_step(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     B = len(rollout_responses)
     G = gradient_accumulation_steps
+    if B == 0 or G <= 0 or B % G != 0:
+        raise ValueError("The rollout batch size must be positive and divisible by gradient_accumulation_steps")
     microbatch = B // G
-    pro_and_outs= tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
+    pro_and_outs = tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
     raw_rewards, rewards_details = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
     advantages, _ = compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
+
+    if importance_reweighting_method != "none":
+        if old_log_probs is None:
+            raise ValueError("old_log_probs is required for off-policy training")
+        if old_log_probs.shape[0] != B:
+            raise ValueError("old_log_probs must have one row per rollout response")
+
+    active_indices = torch.nonzero(advantages != 0, as_tuple=False).flatten()
+    active_count = int(active_indices.numel())
+    effective_G: int = (active_count + microbatch - 1) // microbatch if active_count else 0
+
     optimizer.zero_grad(set_to_none=True)
-    loss = 0
     grad_norm = 0
     total_token_entropy = 0
     total_count = 0
+    clip_count = 0.0
+    clip_total = 0.0
 
     device = next(model.parameters()).device
-    input_ids = pro_and_outs["input_ids"].to(device)
-    labels = pro_and_outs["labels"].to(device)
-    response_mask = pro_and_outs["response_mask"].to(device)
-    advantages = advantages.to(device)
+    loss = torch.zeros((), device=device)
+    input_ids = pro_and_outs["input_ids"].index_select(0, active_indices).to(device)
+    labels = pro_and_outs["labels"].index_select(0, active_indices).to(device)
+    response_mask = pro_and_outs["response_mask"].index_select(0, active_indices).to(device)
+    advantages = advantages.index_select(0, active_indices).to(device)
+    if old_log_probs is not None:
+        old_log_probs = old_log_probs.detach().index_select(
+            0, active_indices.to(old_log_probs.device)
+        ).to(device)
 
-    for start in range(0, len(rollout_responses), microbatch):
+    for microbatch_index in range(effective_G):
+        start = microbatch_index * microbatch
         sl = slice(start, start + microbatch)
         log_probs, token_entropy = get_response_log_probs(model, input_ids[sl], labels[sl], True).values()
-        per_token_loss, _ = compute_policy_gradient_loss(
-            advantages[sl], 
-                     log_probs, importance_reweighting_method, 
-                        old_log_probs[sl] if old_log_probs is not None else None, 
-                                      cliprange, response_mask[sl])
-        loss_mb = aggregate_loss_across_microbatch(per_token_loss, 
-                    response_mask[sl], loss_normalization, normalization_constant)
-        loss_mb = loss_mb / G
+        per_token_loss, loss_metadata = compute_policy_gradient_loss(
+            advantages[sl],
+            log_probs,
+            importance_reweighting_method,
+            old_log_probs[sl] if old_log_probs is not None else None,
+            cliprange,
+            response_mask[sl],
+        )
+        if "clip_mask" in loss_metadata:
+            valid_tokens = response_mask[sl].to(dtype=log_probs.dtype)
+            clip_count += float(
+                (loss_metadata["clip_mask"] * valid_tokens).sum().detach().cpu()
+            )
+            clip_total += float(valid_tokens.sum().detach().cpu())
+        loss_mb = aggregate_loss_across_microbatch(
+            per_token_loss,
+            response_mask[sl],
+            loss_normalization,
+            normalization_constant,
+            sequence_normalization_denominator=microbatch if loss_normalization == "sequence" else None,
+        )
+        if loss_normalization == "sequence":
+            # Per-microbatch loss is an average over sequences, so accumulate
+            # the mean over microbatches.
+            loss_mb = loss_mb / effective_G
+        # For "constant" normalization, normalization_constant Z is already the
+        # global normalizer for the whole optimizer step; microbatch losses are
+        # summed without further scaling.
         loss_mb.backward()
         loss += loss_mb.detach()
         total_token_entropy += (token_entropy * response_mask[sl]).sum().detach()
@@ -242,8 +323,14 @@ def grpo_train_step(
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm).item()
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
+    mean_token_entropy = (total_token_entropy / total_count).item() if total_count else 0.0
+    clip_fraction = clip_count / clip_total if clip_total else 0.0
     return loss, {
         "grad_norm": grad_norm,
-        "mean_token_entropy": (total_token_entropy / total_count).item(),
+        "mean_token_entropy": mean_token_entropy,
+        "clip_fraction": clip_fraction,
+        "clip_count": clip_count,
+        "clip_total": clip_total,
+        "num_pruned_sequences": B - active_count,
         **rewards_details
     }

@@ -63,8 +63,8 @@ class VLLMServer:
     def stop(self) -> None:
         stop_server(self.process, timeout=self.shutdown_timeout)
 
-    def init_weight_sync(self, policy_device: str):
-        self.weight_sync_group = init_weight_sync(self.base_url, policy_device)
+    def init_weight_sync(self, policy_device: str, master_port: int | None = None):
+        self.weight_sync_group = init_weight_sync(self.base_url, policy_device, master_port=master_port)
         return self.weight_sync_group
 
     def sync_policy_weights(self, policy: torch.nn.Module) -> None:
@@ -219,14 +219,15 @@ def generate_completions(
     return completions
 
 
-def init_weight_sync(vllm_base_url: str, policy_device: str):
+def init_weight_sync(vllm_base_url: str, policy_device: str, master_port: int | None = None):
     from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
     from vllm.utils.network_utils import get_ip, get_open_port
 
     inference_world_size = _http_json("GET", f"{vllm_base_url}/get_world_size", timeout=10)["world_size"]
     world_size = inference_world_size + 1
     master_address = get_ip()
-    master_port = get_open_port()
+    if master_port is None:
+        master_port = get_open_port()
     init_info = {
         "master_address": master_address,
         "master_port": master_port,

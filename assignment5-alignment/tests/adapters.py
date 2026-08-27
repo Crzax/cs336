@@ -159,7 +159,7 @@ def run_compute_group_normalized_rewards(
 def run_compute_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
-    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo", "cispo"] = "none",
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     response_mask: torch.Tensor | None = None,
@@ -263,7 +263,7 @@ def run_grpo_train_step(
     baseline: Literal["mean", "none"] = "mean",
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal["std", "none", "mean"] = "std",
-    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo", "cispo"] = "none",
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     loss_normalization: Literal["sequence", "constant"] = "sequence",
