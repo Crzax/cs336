@@ -202,6 +202,8 @@ def generate_completions(
             "seed": sampling_params["seed"],
             "return_token_ids": True,
         }
+        if sampling_params.get("top_p") is not None:
+            payload["top_p"] = sampling_params["top_p"]
         if sampling_params.get("stop") is not None:
             payload["stop"] = sampling_params["stop"]
             payload["include_stop_str_in_output"] = sampling_params.get("include_stop_str_in_output", False)

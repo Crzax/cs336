@@ -2,7 +2,7 @@ alpaca_eval_vllm_llama3_3_70b_fn:
   prompt_template: "alpaca_eval_vllm_llama3_3_70b_fn/alpaca_eval_fn.txt"
   fn_completions: "vllm_local_completions"
   completions_kwargs:
-    model_name: "/mnt/cs336-a5-supplement/models/Llama-3.3-70B-Instruct"
+    model_name: "/mnt/cephfs/user_crzaxchen/models/Llama-3.3-70B-Instruct"
     model_kwargs:
       tokenizer_mode: "auto"
       trust_remote_code: True
@@ -11,5 +11,9 @@ alpaca_eval_vllm_llama3_3_70b_fn:
     max_new_tokens: 100
     temperature: 0.0
     top_p: 1.0
+    # Llama 3.3 emits the required ranking list, then keeps going ("assistant
+    # \n\nI ranked model_1 as 1 because ..."), which breaks ranking_parser's
+    # ast.literal_eval on the whole completion. Cut at the first continuation.
+    stop: ["assistant", "<|eot_id|>", "<|start_header_id|>"]
     batch_size: 900
   fn_completion_parser: "ranking_parser"
